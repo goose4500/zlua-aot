@@ -1,6 +1,7 @@
 const std = @import("std");
 const lexical = @import("lexer.zig");
 const syntax = @import("parser.zig");
+const numeric = @import("numeric.zig");
 
 const Error = error{InvalidArguments};
 
@@ -21,7 +22,9 @@ pub fn main(init: std.process.Init) !void {
 
     var generated = std.Io.Writer.Allocating.init(gpa);
     defer generated.deinit();
-    try emitLauncher(source, input, &generated.writer);
+    const native = try numeric.emitIfEligible(gpa, source, &generated.writer);
+    if (!native) try emitLauncher(source, input, &generated.writer);
+    std.debug.print("zlua-aot backend: {s}\n", .{if (native) "native-numeric" else "luajit-fallback"});
     const c_source = try generated.toOwnedSlice();
     defer gpa.free(c_source);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = c_source });

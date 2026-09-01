@@ -19,4 +19,4 @@ if [ "$cpu" = native-cpu ] || [ "$cpu" = native ]; then
 else
   zig cc -O2 "$tmp" -ldl -o "$output"
 fi
-printf 'AOT compiled %s -> %s (%s)\n' "$input" "$output" "$cpu"
+printf 'Built %s -> %s (%s)\n' "$input" "$output" "$cpu"
