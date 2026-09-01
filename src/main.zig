@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, input, gpa, .limited(64 * 1024 * 1024));
     defer gpa.free(source);
 
-    try validateSyntax(source, input);
+    try validateSyntax(gpa, source, input);
 
     var generated = std.Io.Writer.Allocating.init(gpa);
     defer generated.deinit();
@@ -32,7 +32,7 @@ fn usage() Error {
     return error.InvalidArguments;
 }
 
-fn validateSyntax(source: []const u8, source_name: []const u8) !void {
+fn validateSyntax(allocator: std.mem.Allocator, source: []const u8, source_name: []const u8) !void {
     // Run the lexer explicitly first so even a malformed first token gets a
     // precise diagnostic before parser construction.
     var lexer = lexical.Lexer.init(source);
@@ -46,7 +46,8 @@ fn validateSyntax(source: []const u8, source_name: []const u8) !void {
         if (token_value.tag == .eof) break;
     }
 
-    var parser = try syntax.Parser.init(source);
+    var parser = try syntax.Parser.init(allocator, source);
+    defer parser.deinit();
     parser.parse() catch |err| {
         std.debug.print("{s}:{d}:{d}: syntax error: {s}\n", .{
             source_name, parser.failure.line, parser.failure.column, parser.failure.message,

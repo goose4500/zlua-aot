@@ -1,4 +1,15 @@
+const std = @import("std");
 const lex = @import("lexer.zig");
+
+pub const NodeKind = enum { chunk, block, assignment, call, local, function, if_statement, while_loop, repeat_loop, for_loop, return_statement, break_statement, expression, table };
+pub const Node = struct { kind: NodeKind, start: usize, end: usize };
+pub const Ast = struct {
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayList(Node),
+    pub fn deinit(self: *Ast) void {
+        self.nodes.deinit(self.allocator);
+    }
+};
 
 pub const ParseError = error{ MalformedToken, InvalidSyntax };
 
@@ -14,9 +25,14 @@ pub const Parser = struct {
     lexer: lex.Lexer,
     current: lex.Token = undefined,
     failure: Failure = .{},
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayList(Node) = .empty,
+    loop_depth: usize = 0,
+    function_depth: usize = 0,
+    vararg_function: bool = false,
 
-    pub fn init(source: []const u8) error{MalformedToken}!Parser {
-        var parser: Parser = .{ .lexer = lex.Lexer.init(source) };
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) error{MalformedToken}!Parser {
+        var parser: Parser = .{ .lexer = lex.Lexer.init(source), .allocator = allocator };
         parser.current = parser.lexer.next() catch {
             parser.copyLexFailure();
             return error.MalformedToken;
@@ -24,59 +40,101 @@ pub const Parser = struct {
         return parser;
     }
 
-    pub fn parse(self: *Parser) error{ MalformedToken, InvalidSyntax }!void {
+    pub fn deinit(self: *Parser) void {
+        self.nodes.deinit(self.allocator);
+    }
+
+    pub fn takeAst(self: *Parser) Ast {
+        const result: Ast = .{ .allocator = self.allocator, .nodes = self.nodes };
+        self.nodes = .empty;
+        return result;
+    }
+
+    pub fn parse(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
+        const start = self.current.start;
         try self.block(&.{.eof});
+        try self.addNode(.chunk, start);
         try self.expect(.eof, "expected end of file");
     }
 
-    fn block(self: *Parser, stops: []const lex.Tag) ParseError!void {
+    fn addNode(self: *Parser, kind: NodeKind, start: usize) std.mem.Allocator.Error!void {
+        try self.nodes.append(self.allocator, .{ .kind = kind, .start = start, .end = self.current.start });
+    }
+
+    fn block(self: *Parser, stops: []const lex.Tag) (ParseError || std.mem.Allocator.Error)!void {
         while (!contains(stops, self.current.tag) and self.current.tag != .eof) {
             try self.statement();
             _ = try self.accept(.semicolon);
         }
     }
 
-    fn statement(self: *Parser) ParseError!void {
-        switch (self.current.tag) {
-            .kw_do => {
+    fn statement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
+        const start = self.current.start;
+        const kind: NodeKind = switch (self.current.tag) {
+            .kw_do => blk: {
                 try self.advance();
                 try self.block(&.{.kw_end});
                 try self.expect(.kw_end, "expected 'end' after do block");
+                break :blk .block;
             },
-            .kw_while => {
+            .kw_while => blk: {
                 try self.advance();
                 try self.expression();
                 try self.expect(.kw_do, "expected 'do' after while condition");
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
                 try self.block(&.{.kw_end});
                 try self.expect(.kw_end, "expected 'end' after while loop");
+                break :blk .while_loop;
             },
-            .kw_repeat => {
+            .kw_repeat => blk: {
                 try self.advance();
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
                 try self.block(&.{.kw_until});
                 try self.expect(.kw_until, "expected 'until' after repeat block");
                 try self.expression();
+                break :blk .repeat_loop;
             },
-            .kw_if => try self.ifStatement(),
-            .kw_for => try self.forStatement(),
-            .kw_function => {
+            .kw_if => blk: {
+                try self.ifStatement();
+                break :blk .if_statement;
+            },
+            .kw_for => blk: {
+                try self.forStatement();
+                break :blk .for_loop;
+            },
+            .kw_function => blk: {
                 try self.advance();
                 try self.expect(.name, "expected function name");
                 while (try self.accept(.dot)) try self.expect(.name, "expected name after '.'");
                 if (try self.accept(.colon)) try self.expect(.name, "expected method name");
                 try self.functionBody();
+                break :blk .function;
             },
-            .kw_local => try self.localStatement(),
-            .kw_return => {
+            .kw_local => blk: {
+                try self.localStatement();
+                break :blk .local;
+            },
+            .kw_return => blk: {
                 try self.advance();
-                if (!contains(&.{ .eof, .kw_end, .kw_else, .kw_elseif, .kw_until, .semicolon }, self.current.tag))
-                    try self.expressionList();
+                if (!contains(&.{ .eof, .kw_end, .kw_else, .kw_elseif, .kw_until, .semicolon }, self.current.tag)) try self.expressionList();
+                break :blk .return_statement;
             },
-            .kw_break => try self.advance(),
-            else => try self.assignmentOrCall(),
-        }
+            .kw_break => blk: {
+                if (self.loop_depth == 0) return self.syntax("'break' is only valid inside a loop");
+                try self.advance();
+                break :blk .break_statement;
+            },
+            else => blk: {
+                const assignment = try self.assignmentOrCall();
+                break :blk if (assignment) .assignment else .call;
+            },
+        };
+        try self.addNode(kind, start);
     }
 
-    fn ifStatement(self: *Parser) ParseError!void {
+    fn ifStatement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.advance();
         try self.expression();
         try self.expect(.kw_then, "expected 'then'");
@@ -90,7 +148,7 @@ pub const Parser = struct {
         try self.expect(.kw_end, "expected 'end' after if statement");
     }
 
-    fn forStatement(self: *Parser) ParseError!void {
+    fn forStatement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.advance();
         try self.expect(.name, "expected loop variable");
         if (try self.accept(.assign)) {
@@ -104,11 +162,13 @@ pub const Parser = struct {
             try self.expressionList();
         }
         try self.expect(.kw_do, "expected 'do' in for loop");
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
         try self.block(&.{.kw_end});
         try self.expect(.kw_end, "expected 'end' after for loop");
     }
 
-    fn localStatement(self: *Parser) ParseError!void {
+    fn localStatement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.advance();
         if (try self.accept(.kw_function)) {
             try self.expect(.name, "expected local function name");
@@ -119,27 +179,30 @@ pub const Parser = struct {
         if (try self.accept(.assign)) try self.expressionList();
     }
 
-    fn assignmentOrCall(self: *Parser) ParseError!void {
+    fn assignmentOrCall(self: *Parser) (ParseError || std.mem.Allocator.Error)!bool {
         const first = try self.prefixExpression();
-        if (first == .call and self.current.tag != .assign and self.current.tag != .comma) return;
+        if (first == .call and self.current.tag != .assign and self.current.tag != .comma) return false;
         if (first != .assignable) return self.syntax("expected assignment or function call");
         while (try self.accept(.comma)) {
             if (try self.prefixExpression() != .assignable) return self.syntax("expected assignable expression");
         }
         try self.expect(.assign, "expected '=' in assignment");
         try self.expressionList();
+        return true;
     }
 
-    fn expressionList(self: *Parser) ParseError!void {
+    fn expressionList(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.expression();
         while (try self.accept(.comma)) try self.expression();
     }
 
-    fn expression(self: *Parser) ParseError!void {
+    fn expression(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
+        const start = self.current.start;
         try self.subExpression(0);
+        try self.addNode(.expression, start);
     }
 
-    fn subExpression(self: *Parser, minimum: u8) ParseError!void {
+    fn subExpression(self: *Parser, minimum: u8) (ParseError || std.mem.Allocator.Error)!void {
         if (self.current.tag == .kw_not or self.current.tag == .minus or self.current.tag == .hash) {
             try self.advance();
             try self.subExpression(7);
@@ -152,9 +215,13 @@ pub const Parser = struct {
         }
     }
 
-    fn simpleExpression(self: *Parser) ParseError!void {
+    fn simpleExpression(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         switch (self.current.tag) {
-            .kw_nil, .kw_false, .kw_true, .number, .string, .varargs => try self.advance(),
+            .kw_nil, .kw_false, .kw_true, .number, .string => try self.advance(),
+            .varargs => {
+                if (!self.vararg_function) return self.syntax("'...' is only valid inside a vararg function");
+                try self.advance();
+            },
             .kw_function => {
                 try self.advance();
                 try self.functionBody();
@@ -165,7 +232,7 @@ pub const Parser = struct {
         }
     }
 
-    fn prefixExpression(self: *Parser) ParseError!PrefixKind {
+    fn prefixExpression(self: *Parser) (ParseError || std.mem.Allocator.Error)!PrefixKind {
         var kind: PrefixKind = undefined;
         if (try self.accept(.l_paren)) {
             try self.expression();
@@ -201,7 +268,7 @@ pub const Parser = struct {
         };
     }
 
-    fn arguments(self: *Parser) ParseError!void {
+    fn arguments(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         if (try self.accept(.l_paren)) {
             if (self.current.tag != .r_paren) try self.expressionList();
             try self.expect(.r_paren, "expected ')' after arguments");
@@ -210,23 +277,39 @@ pub const Parser = struct {
         } else try self.expect(.string, "expected function arguments");
     }
 
-    fn functionBody(self: *Parser) ParseError!void {
+    fn functionBody(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.expect(.l_paren, "expected '(' before parameters");
+        var is_vararg = false;
         if (self.current.tag != .r_paren) {
-            if (!try self.accept(.varargs)) {
+            if (try self.accept(.varargs)) {
+                is_vararg = true;
+            } else {
                 try self.expect(.name, "expected parameter name");
                 while (try self.accept(.comma)) {
-                    if (try self.accept(.varargs)) break;
+                    if (try self.accept(.varargs)) {
+                        is_vararg = true;
+                        break;
+                    }
                     try self.expect(.name, "expected parameter name");
                 }
             }
         }
         try self.expect(.r_paren, "expected ')' after parameters");
+        const old_vararg = self.vararg_function;
+        const old_loop_depth = self.loop_depth;
+        self.function_depth += 1;
+        self.vararg_function = is_vararg;
+        self.loop_depth = 0;
+        defer {
+            self.function_depth -= 1;
+            self.vararg_function = old_vararg;
+            self.loop_depth = old_loop_depth;
+        }
         try self.block(&.{.kw_end});
         try self.expect(.kw_end, "expected 'end' after function body");
     }
 
-    fn tableConstructor(self: *Parser) ParseError!void {
+    fn tableConstructor(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.expect(.l_brace, "expected '{'");
         while (self.current.tag != .r_brace) {
             if (try self.accept(.l_bracket)) {
@@ -249,12 +332,12 @@ pub const Parser = struct {
         return (copy.next() catch return error.MalformedToken).tag;
     }
 
-    fn accept(self: *Parser, tag: lex.Tag) ParseError!bool {
+    fn accept(self: *Parser, tag: lex.Tag) (ParseError || std.mem.Allocator.Error)!bool {
         if (self.current.tag != tag) return false;
         try self.advance();
         return true;
     }
-    fn expect(self: *Parser, tag: lex.Tag, message: []const u8) ParseError!void {
+    fn expect(self: *Parser, tag: lex.Tag, message: []const u8) (ParseError || std.mem.Allocator.Error)!void {
         if (self.current.tag != tag) return self.syntax(message);
         try self.advance();
     }
@@ -292,7 +375,6 @@ fn binaryPrecedence(tag: lex.Tag) ?Precedence {
     };
 }
 
-const std = @import("std");
 test "parses representative Lua 5.1 program" {
     const source =
         \\local function fib(n)
@@ -302,11 +384,37 @@ test "parses representative Lua 5.1 program" {
         \\local t = { answer = 42, [1] = fib(8), 9 }
         \\for k, v in pairs(t) do print(k, v) end
     ;
-    var parser = try Parser.init(source);
+    var parser = try Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
     try parser.parse();
+    try std.testing.expect(parser.nodes.items.len > 5);
 }
 
 test "rejects incomplete blocks" {
-    var parser = try Parser.init("if true then print(1)");
+    var parser = try Parser.init(std.testing.allocator, "if true then print(1)");
+    defer parser.deinit();
     try std.testing.expectError(error.InvalidSyntax, parser.parse());
+}
+
+test "semantic control-flow checks" {
+    var outside_loop = try Parser.init(std.testing.allocator, "break");
+    defer outside_loop.deinit();
+    try std.testing.expectError(error.InvalidSyntax, outside_loop.parse());
+
+    var outside_vararg = try Parser.init(std.testing.allocator, "return ...");
+    defer outside_vararg.deinit();
+    try std.testing.expectError(error.InvalidSyntax, outside_vararg.parse());
+
+    var valid = try Parser.init(std.testing.allocator, "while true do break end; return function(...) return ... end");
+    defer valid.deinit();
+    try valid.parse();
+}
+
+test "AST ownership transfers from parser" {
+    var parser = try Parser.init(std.testing.allocator, "local x = 1 + 2; print(x)");
+    defer parser.deinit();
+    try parser.parse();
+    var ast = parser.takeAst();
+    defer ast.deinit();
+    try std.testing.expect(ast.nodes.items.len >= 5);
 }
