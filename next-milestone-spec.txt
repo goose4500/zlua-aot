@@ -1,0 +1,323 @@
+ZLUA-AOT NEXT MILESTONE SPECIFICATION
+====================================
+Milestone: Function-level hybrid AOT compilation
+Status: Proposed implementation contract
+Target: LuaJIT 2.x / Lua 5.1 on Linux ARM64
+
+1. PURPOSE
+----------
+Move zlua-aot from whole-chunk backend selection to per-function selection.
+A single program must be able to execute eligible numeric functions as native
+machine code while all other code continues to execute with LuaJIT semantics.
+
+Target behavior:
+
+    --@aot-number
+    function square_add(x, y)
+        return x * x + y
+    end
+
+    local result = square_add(4, 2)
+    print({ result = result })
+
+The main chunk and table operations use LuaJIT. square_add is registered as a
+native Lua C function generated ahead of time.
+
+2. SUCCESS CRITERIA
+-------------------
+The milestone is complete when all of the following are true:
+
+1. One source file can use both native functions and dynamic Lua code.
+2. An explicitly annotated eligible function is lowered through typed IR.
+3. The generated executable registers the native function through the Lua 5.1
+   C API before the main chunk executes.
+4. Calls from LuaJIT into the function execute native arithmetic.
+5. Arguments are guarded as Lua numbers before native computation.
+6. A guard failure invokes the original Lua implementation, preserving Lua
+   behavior instead of producing undefined behavior.
+7. Return values are pushed through the Lua 5.1 API as Lua numbers.
+8. Unsupported annotated functions receive a source-located compile diagnostic.
+9. Unannotated and unsupported code remains on the LuaJIT compatibility path.
+10. Existing native whole-chunk and LuaJIT fallback behavior remains working.
+11. End-to-end tests prove both native and fallback paths in one executable.
+
+3. SCOPE
+--------
+Initial native function subset:
+
+- Global named functions only: function name(...)
+- Explicit --@aot-number annotation immediately before the function
+- Zero or more named parameters
+- Parameters have guarded Lua number inputs
+- Numeric local declarations
+- Numeric assignments
+- Unary + and -
+- Binary +, -, *, /
+- One final return expression
+- Calls may originate from arbitrary LuaJIT code
+
+All accepted IR values have the static type number.
+
+Functions must not initially contain:
+
+- Varargs
+- Nested functions
+- Captured values or upvalues
+- Table access
+- Function calls
+- Metamethod-sensitive operations
+- Loops or branches
+- Multiple returns
+- Cdata numeric values
+- Mutation of globals
+- yield, coroutine operations, or protected-call boundaries
+
+These restrictions must cause a clear eligibility diagnostic for annotated
+functions. They must never silently generate incorrect native code.
+
+4. NON-GOALS
+------------
+This milestone does not require:
+
+- Automatic discovery of functions without an annotation
+- Native closures or upvalue storage
+- Native tables, strings, booleans, or nil
+- Profile-guided specialization
+- General deoptimization or stack reconstruction
+- Replacing LuaJIT's garbage collector
+- Reimplementing the Lua standard library
+- Windows or macOS dynamic loading
+- Lua 5.2, 5.3, or 5.4 compatibility
+
+5. REQUIRED ARCHITECTURE
+------------------------
+The desired pipeline is:
+
+    Lua source
+      -> one full lexer/parser
+      -> hierarchical function AST
+      -> existing semantic symbol resolution
+      -> annotation and eligibility analysis
+      -> typed numeric function IR
+      -> native C emission
+      -> Lua 5.1 C API registration
+
+The function compiler must consume the main frontend representation. It must
+not introduce another line-oriented source parser.
+
+The current standalone numeric IR types may be generalized and reused. Source
+text may be retained for diagnostics and literal spelling, but generated code
+must be driven by IR nodes rather than copied expressions.
+
+6. FRONTEND WORK
+----------------
+Extend the AST so it owns explicit relationships for:
+
+- Function declarations
+- Parameter lists
+- Function bodies
+- Local declarations
+- Assignments
+- Return statements
+- Number literals
+- Symbol references
+- Unary expressions
+- Binary expressions
+
+Each node must retain a source span. Symbol reference nodes must carry the
+resolved symbol ID and resolution class produced by semantic analysis.
+
+Record comments needed for compiler directives. The lexer may expose directive
+comments separately rather than treating all comments as syntax tokens.
+
+Recognized directive syntax:
+
+    --@aot-number
+
+It applies only to the immediately following global function declaration.
+Blank lines are allowed. Any other intervening statement cancels association.
+
+7. FUNCTION ELIGIBILITY
+-----------------------
+An annotated function is eligible only if analysis proves:
+
+- Every parameter is used as a number.
+- Every local initializer is numeric.
+- Every reference resolves to a parameter or function-local numeric symbol.
+- No symbol is captured.
+- Every operation exists in the supported numeric IR.
+- The body terminates with exactly one numeric return expression.
+- There are no side effects other than local assignment.
+
+Because the annotation is explicit, ineligibility is a compile error rather
+than silent LuaJIT fallback. Diagnostics must identify the unsupported node and
+its line and column.
+
+Unannotated functions always remain LuaJIT functions.
+
+8. SOURCE REWRITING AND REGISTRATION
+------------------------------------
+The generated compatibility chunk must not overwrite a registered native
+function. For each accepted annotated global function:
+
+1. Preserve the original Lua function body as a fallback chunk.
+2. Remove or replace its declaration in the main source presented to LuaJIT.
+3. Compile the fallback function with luaL_loadbuffer during initialization.
+4. Store the fallback closure in the Lua registry using a collision-resistant
+   generated key.
+5. Register the generated native lua_CFunction under the original global name.
+6. Execute the transformed main chunk only after registration.
+
+Do not perform byte offsets using Unicode code-point counts. AST spans and
+rewrites must use original source byte offsets.
+
+Multiple rewritten ranges must be sorted and proven non-overlapping before
+emission.
+
+9. LUA C API BRIDGE
+-------------------
+The generated launcher currently resolves symbols dynamically. Extend it with:
+
+- lua_gettop
+- lua_type or lua_isnumber-compatible checks
+- lua_tonumber
+- lua_pushnumber
+- lua_rawget or lua_getfield for registry fallback lookup
+- lua_pcall
+- any stack manipulation functions required by the fallback call
+
+Use Lua 5.1 ABI constants explicitly and document them in generated code.
+Do not assume Lua headers are installed.
+
+Native wrapper behavior:
+
+1. Confirm the exact expected argument count or document accepted extra args.
+2. Confirm each required argument is a Lua number without coercing arbitrary
+   strings unless LuaJIT 5.1 equivalence is explicitly tested.
+3. On successful guards, call the generated native implementation.
+4. Push one Lua number and return 1.
+5. On failed guards, call the registry-stored original Lua closure with the
+   original arguments and return its result or propagate its Lua error.
+
+The fallback path must preserve stack balance. Add stack-oriented tests.
+
+10. NATIVE CODE GENERATION
+--------------------------
+Emit two C functions per native Lua function:
+
+    static double zlua_impl_square_add(double x, double y);
+    static int zlua_wrap_square_add(lua_State *L);
+
+The implementation contains only typed native operations. The wrapper contains
+Lua ABI guards, conversion, fallback dispatch, and result pushing.
+
+Generated C identifiers must be mangled and independent of user-controlled C
+identifiers. Suggested format:
+
+    zlua_fn_<stable_function_index>
+    zlua_wrap_<stable_function_index>
+    zlua_fallback_<stable_function_index>
+
+Do not use Lua identifiers directly as C identifiers.
+
+11. SEMANTIC REQUIREMENTS
+-------------------------
+Preserve:
+
+- Left-to-right observable evaluation order
+- LuaJIT double behavior for accepted arithmetic
+- Lua error propagation from fallback functions
+- Original global function name
+- Original function behavior when guards fail
+- Original source name in load/traceback diagnostics where practical
+
+Division by zero, NaN, infinity, and signed zero require differential tests
+against the installed LuaJIT runtime before being declared equivalent.
+
+12. TEST PLAN
+-------------
+Unit tests:
+
+- Directive association and cancellation
+- Function AST hierarchy and spans
+- Parameter/local symbol resolution
+- Eligible expression-to-IR conversion
+- Rejection of upvalues, calls, tables, varargs, branches, and loops
+- Non-overlapping source rewrite planning
+- C identifier mangling
+
+Integration tests:
+
+- Annotated numeric global called by a dynamic Lua chunk
+- Dynamic table receives native result
+- Two native functions in one file
+- Native function called repeatedly
+- Wrong argument type invokes original Lua fallback
+- Fallback error propagates as a Lua error
+- Unannotated numeric function remains LuaJIT-backed
+- Existing examples/numeric.lua still selects whole-chunk native mode
+- Existing examples/full.lua still selects LuaJIT compatibility mode
+
+Differential tests against LuaJIT:
+
+- Positive and negative finite numbers
+- Zero and negative zero
+- Large and small magnitudes
+- Infinity and NaN where constructible
+- Division by zero
+- Wrong argument count
+- Numeric strings, with expected coercion policy documented
+
+Generated-artifact checks:
+
+- Mixed executable dynamically loads LuaJIT
+- Whole-chunk numeric executable has no Lua dependency
+- Generated C contains native implementation and wrapper symbols
+- Main transformed chunk does not redeclare the native global
+
+13. DIAGNOSTICS
+---------------
+Minimum diagnostic examples:
+
+    file.lua:4:12: AOT eligibility error: table indexing is not supported
+    file.lua:2:1: AOT eligibility error: annotated function must be global
+    file.lua:5:9: AOT eligibility error: reference 'scale' is an upvalue
+
+Diagnostics should distinguish lexical, syntax, semantic, AOT eligibility,
+C compilation, and runtime errors.
+
+14. IMPLEMENTATION ORDER
+------------------------
+Recommended sequence:
+
+1. Add hierarchical function and expression AST nodes.
+2. Attach resolved symbols to expression references.
+3. Capture --@aot-number directives and associate them with functions.
+4. Convert eligible function ASTs into generalized numeric IR.
+5. Add source rewrite planning and tests.
+6. Emit native implementations and Lua C wrappers.
+7. Add required dynamically resolved Lua API symbols.
+8. Register native globals before executing the transformed main chunk.
+9. Add registry-backed original-function fallback.
+10. Add integration and differential tests.
+11. Retain and rerun all existing frontend and backend tests.
+
+15. DEFINITION OF DONE
+----------------------
+The milestone is done only when this program uses both backends in one process:
+
+    --@aot-number
+    function square_add(x, y)
+        return x * x + y
+    end
+
+    local dynamic = { value = square_add(4, 2) }
+    assert(dynamic.value == 18)
+    assert(type(square_add) == "function")
+
+and a non-number call demonstrably executes the preserved Lua implementation
+rather than native arithmetic or undefined behavior.
+
+The README must then describe zlua-aot as function-level hybrid AOT, list the
+accepted annotation and subset, and retain an honest account of LuaJIT runtime
+dependence for mixed programs.
