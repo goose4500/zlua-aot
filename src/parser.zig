@@ -3,11 +3,30 @@ const lex = @import("lexer.zig");
 
 pub const NodeKind = enum { chunk, block, assignment, call, local, function, if_statement, while_loop, repeat_loop, for_loop, return_statement, break_statement, expression, table };
 pub const Node = struct { kind: NodeKind, start: usize, end: usize };
+pub const SymbolKind = enum { local, parameter };
+pub const Symbol = struct {
+    name_start: usize,
+    name_end: usize,
+    kind: SymbolKind,
+    function_depth: usize,
+    captured: bool = false,
+};
+pub const Resolution = enum { local, upvalue, global };
+pub const Reference = struct {
+    name_start: usize,
+    name_end: usize,
+    resolution: Resolution,
+    symbol: ?usize,
+};
 pub const Ast = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Node),
+    symbols: std.ArrayList(Symbol),
+    references: std.ArrayList(Reference),
     pub fn deinit(self: *Ast) void {
         self.nodes.deinit(self.allocator);
+        self.symbols.deinit(self.allocator);
+        self.references.deinit(self.allocator);
     }
 };
 
@@ -27,6 +46,9 @@ pub const Parser = struct {
     failure: Failure = .{},
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(Node) = .empty,
+    symbols: std.ArrayList(Symbol) = .empty,
+    references: std.ArrayList(Reference) = .empty,
+    active_symbols: std.ArrayList(usize) = .empty,
     loop_depth: usize = 0,
     function_depth: usize = 0,
     vararg_function: bool = false,
@@ -42,11 +64,16 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         self.nodes.deinit(self.allocator);
+        self.symbols.deinit(self.allocator);
+        self.references.deinit(self.allocator);
+        self.active_symbols.deinit(self.allocator);
     }
 
     pub fn takeAst(self: *Parser) Ast {
-        const result: Ast = .{ .allocator = self.allocator, .nodes = self.nodes };
+        const result: Ast = .{ .allocator = self.allocator, .nodes = self.nodes, .symbols = self.symbols, .references = self.references };
         self.nodes = .empty;
+        self.symbols = .empty;
+        self.references = .empty;
         return result;
     }
 
@@ -62,6 +89,12 @@ pub const Parser = struct {
     }
 
     fn block(self: *Parser, stops: []const lex.Tag) (ParseError || std.mem.Allocator.Error)!void {
+        const symbol_mark = self.active_symbols.items.len;
+        defer self.active_symbols.items.len = symbol_mark;
+        try self.blockContents(stops);
+    }
+
+    fn blockContents(self: *Parser, stops: []const lex.Tag) (ParseError || std.mem.Allocator.Error)!void {
         while (!contains(stops, self.current.tag) and self.current.tag != .eof) {
             try self.statement();
             _ = try self.accept(.semicolon);
@@ -91,7 +124,9 @@ pub const Parser = struct {
                 try self.advance();
                 self.loop_depth += 1;
                 defer self.loop_depth -= 1;
-                try self.block(&.{.kw_until});
+                const active_mark = self.active_symbols.items.len;
+                defer self.active_symbols.items.len = active_mark;
+                try self.blockContents(&.{.kw_until});
                 try self.expect(.kw_until, "expected 'until' after repeat block");
                 try self.expression();
                 break :blk .repeat_loop;
@@ -106,7 +141,9 @@ pub const Parser = struct {
             },
             .kw_function => blk: {
                 try self.advance();
-                try self.expect(.name, "expected function name");
+                if (self.current.tag != .name) return self.syntax("expected function name");
+                try self.recordReference(self.current);
+                try self.advance();
                 while (try self.accept(.dot)) try self.expect(.name, "expected name after '.'");
                 if (try self.accept(.colon)) try self.expect(.name, "expected method name");
                 try self.functionBody();
@@ -150,18 +187,29 @@ pub const Parser = struct {
 
     fn forStatement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.advance();
-        try self.expect(.name, "expected loop variable");
+        var names: std.ArrayList(lex.Token) = .empty;
+        defer names.deinit(self.allocator);
+        if (self.current.tag != .name) return self.syntax("expected loop variable");
+        try names.append(self.allocator, self.current);
+        try self.advance();
         if (try self.accept(.assign)) {
             try self.expression();
             try self.expect(.comma, "expected ',' in numeric for loop");
             try self.expression();
             if (try self.accept(.comma)) try self.expression();
         } else {
-            while (try self.accept(.comma)) try self.expect(.name, "expected loop variable");
+            while (try self.accept(.comma)) {
+                if (self.current.tag != .name) return self.syntax("expected loop variable");
+                try names.append(self.allocator, self.current);
+                try self.advance();
+            }
             try self.expect(.kw_in, "expected 'in' in generic for loop");
             try self.expressionList();
         }
         try self.expect(.kw_do, "expected 'do' in for loop");
+        const active_mark = self.active_symbols.items.len;
+        defer self.active_symbols.items.len = active_mark;
+        for (names.items) |name| try self.declare(name, .local);
         self.loop_depth += 1;
         defer self.loop_depth -= 1;
         try self.block(&.{.kw_end});
@@ -171,12 +219,24 @@ pub const Parser = struct {
     fn localStatement(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.advance();
         if (try self.accept(.kw_function)) {
-            try self.expect(.name, "expected local function name");
+            if (self.current.tag != .name) return self.syntax("expected local function name");
+            const name = self.current;
+            try self.advance();
+            try self.declare(name, .local); // recursive local function sees itself
             return self.functionBody();
         }
-        try self.expect(.name, "expected local variable name");
-        while (try self.accept(.comma)) try self.expect(.name, "expected local variable name");
+        var names: std.ArrayList(lex.Token) = .empty;
+        defer names.deinit(self.allocator);
+        if (self.current.tag != .name) return self.syntax("expected local variable name");
+        try names.append(self.allocator, self.current);
+        try self.advance();
+        while (try self.accept(.comma)) {
+            if (self.current.tag != .name) return self.syntax("expected local variable name");
+            try names.append(self.allocator, self.current);
+            try self.advance();
+        }
         if (try self.accept(.assign)) try self.expressionList();
+        for (names.items) |name| try self.declare(name, .local);
     }
 
     fn assignmentOrCall(self: *Parser) (ParseError || std.mem.Allocator.Error)!bool {
@@ -239,7 +299,9 @@ pub const Parser = struct {
             try self.expect(.r_paren, "expected ')' after expression");
             kind = .value;
         } else {
-            try self.expect(.name, "expected name or parenthesized expression");
+            if (self.current.tag != .name) return self.syntax("expected name or parenthesized expression");
+            try self.recordReference(self.current);
+            try self.advance();
             kind = .assignable;
         }
         while (true) switch (self.current.tag) {
@@ -279,32 +341,41 @@ pub const Parser = struct {
 
     fn functionBody(self: *Parser) (ParseError || std.mem.Allocator.Error)!void {
         try self.expect(.l_paren, "expected '(' before parameters");
+        var parameters: std.ArrayList(lex.Token) = .empty;
+        defer parameters.deinit(self.allocator);
         var is_vararg = false;
         if (self.current.tag != .r_paren) {
             if (try self.accept(.varargs)) {
                 is_vararg = true;
             } else {
-                try self.expect(.name, "expected parameter name");
+                if (self.current.tag != .name) return self.syntax("expected parameter name");
+                try parameters.append(self.allocator, self.current);
+                try self.advance();
                 while (try self.accept(.comma)) {
                     if (try self.accept(.varargs)) {
                         is_vararg = true;
                         break;
                     }
-                    try self.expect(.name, "expected parameter name");
+                    if (self.current.tag != .name) return self.syntax("expected parameter name");
+                    try parameters.append(self.allocator, self.current);
+                    try self.advance();
                 }
             }
         }
         try self.expect(.r_paren, "expected ')' after parameters");
         const old_vararg = self.vararg_function;
         const old_loop_depth = self.loop_depth;
+        const active_mark = self.active_symbols.items.len;
         self.function_depth += 1;
         self.vararg_function = is_vararg;
         self.loop_depth = 0;
         defer {
+            self.active_symbols.items.len = active_mark;
             self.function_depth -= 1;
             self.vararg_function = old_vararg;
             self.loop_depth = old_loop_depth;
         }
+        for (parameters.items) |parameter| try self.declare(parameter, .parameter);
         try self.block(&.{.kw_end});
         try self.expect(.kw_end, "expected 'end' after function body");
     }
@@ -325,6 +396,46 @@ pub const Parser = struct {
             if (!try self.accept(.comma) and !try self.accept(.semicolon)) break;
         }
         try self.expect(.r_brace, "expected '}' after table constructor");
+    }
+
+    fn declare(self: *Parser, token_value: lex.Token, kind: SymbolKind) std.mem.Allocator.Error!void {
+        const index = self.symbols.items.len;
+        try self.symbols.append(self.allocator, .{
+            .name_start = token_value.start,
+            .name_end = token_value.end,
+            .kind = kind,
+            .function_depth = self.function_depth,
+        });
+        try self.active_symbols.append(self.allocator, index);
+    }
+
+    fn recordReference(self: *Parser, token_value: lex.Token) std.mem.Allocator.Error!void {
+        const name = token_value.text(self.lexer.source);
+        var found: ?usize = null;
+        var i = self.active_symbols.items.len;
+        while (i > 0) {
+            i -= 1;
+            const symbol_index = self.active_symbols.items[i];
+            const symbol = &self.symbols.items[symbol_index];
+            if (std.mem.eql(u8, name, self.lexer.source[symbol.name_start..symbol.name_end])) {
+                found = symbol_index;
+                break;
+            }
+        }
+        var resolution: Resolution = .global;
+        if (found) |symbol_index| {
+            const symbol = &self.symbols.items[symbol_index];
+            if (symbol.function_depth == self.function_depth) resolution = .local else {
+                resolution = .upvalue;
+                symbol.captured = true;
+            }
+        }
+        try self.references.append(self.allocator, .{
+            .name_start = token_value.start,
+            .name_end = token_value.end,
+            .resolution = resolution,
+            .symbol = found,
+        });
     }
 
     fn peekTag(self: *Parser) error{MalformedToken}!lex.Tag {
@@ -417,4 +528,45 @@ test "AST ownership transfers from parser" {
     var ast = parser.takeAst();
     defer ast.deinit();
     try std.testing.expect(ast.nodes.items.len >= 5);
+    try std.testing.expectEqual(@as(usize, 1), ast.symbols.items.len);
+}
+
+test "local visibility follows Lua initializer and block rules" {
+    const source = "local x = x; do local hidden = x end; print(hidden)";
+    var parser = try Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
+    try parser.parse();
+    var ast = parser.takeAst();
+    defer ast.deinit();
+    try std.testing.expectEqual(Resolution.global, ast.references.items[0].resolution); // initializer x
+    try std.testing.expectEqual(Resolution.local, ast.references.items[1].resolution); // block sees x
+    try std.testing.expectEqual(Resolution.global, ast.references.items[2].resolution); // print
+    try std.testing.expectEqual(Resolution.global, ast.references.items[3].resolution); // hidden expired
+}
+
+test "resolves locals upvalues globals and captures" {
+    const source = "local x = 1; function outer(a) local y = x+a; return function(b) return x+y+b+g end end";
+    var parser = try Parser.init(std.testing.allocator, source);
+    defer parser.deinit();
+    try parser.parse();
+    var ast = parser.takeAst();
+    defer ast.deinit();
+
+    var locals: usize = 0;
+    var upvalues: usize = 0;
+    var globals: usize = 0;
+    for (ast.references.items) |reference| switch (reference.resolution) {
+        .local => locals += 1,
+        .upvalue => upvalues += 1,
+        .global => globals += 1,
+    };
+    try std.testing.expectEqual(@as(usize, 2), locals);
+    try std.testing.expectEqual(@as(usize, 3), upvalues);
+    try std.testing.expect(globals >= 2);
+
+    var captured: usize = 0;
+    for (ast.symbols.items) |symbol| if (symbol.captured) {
+        captured += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), captured);
 }

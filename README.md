@@ -42,7 +42,7 @@ LuaJIT must therefore be installed on the target machine. `RTLD_GLOBAL` is used 
 ## Architecture roadmap
 
 1. **Compatibility backend (complete):** complete language and C-module behavior through system LuaJIT.
-2. **Frontend (in progress):** the Zig lexer and recursive-descent parser cover Lua 5.1 syntax. Parsing now produces an allocator-owned, source-spanned AST suitable for later analysis. Initial semantic context checks reject `break` outside loops and `...` outside vararg functions, including correct function-boundary handling. Symbol/scope resolution and richer typed expression nodes remain next.
+2. **Frontend (in progress):** the Zig lexer and recursive-descent parser cover Lua 5.1 syntax and produce an allocator-owned, source-spanned AST. Semantic analysis tracks lexical scopes, declarations and parameters; resolves every name as local, upvalue or global; marks captured symbols; handles initializer visibility and function boundaries; and validates `break`/vararg context. Hierarchical typed expression nodes remain next.
 3. **Typed IR:** flow-sensitive types, escape analysis and guards.
 4. **Native kernels:** lower stable numeric functions to optimized Zig/LLVM code.
 5. **Deoptimization bridge:** fall back to LuaJIT when specialization guards fail.
