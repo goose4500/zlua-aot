@@ -1,5 +1,6 @@
 const std = @import("std");
 const lexical = @import("lexer.zig");
+const syntax = @import("parser.zig");
 
 const Error = error{InvalidArguments};
 
@@ -16,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
     const source = try std.Io.Dir.cwd().readFileAlloc(io, input, gpa, .limited(64 * 1024 * 1024));
     defer gpa.free(source);
 
-    try validateTokens(source, input);
+    try validateSyntax(source, input);
 
     var generated = std.Io.Writer.Allocating.init(gpa);
     defer generated.deinit();
@@ -31,7 +32,9 @@ fn usage() Error {
     return error.InvalidArguments;
 }
 
-fn validateTokens(source: []const u8, source_name: []const u8) !void {
+fn validateSyntax(source: []const u8, source_name: []const u8) !void {
+    // Run the lexer explicitly first so even a malformed first token gets a
+    // precise diagnostic before parser construction.
     var lexer = lexical.Lexer.init(source);
     while (true) {
         const token_value = lexer.next() catch |err| {
@@ -42,6 +45,14 @@ fn validateTokens(source: []const u8, source_name: []const u8) !void {
         };
         if (token_value.tag == .eof) break;
     }
+
+    var parser = try syntax.Parser.init(source);
+    parser.parse() catch |err| {
+        std.debug.print("{s}:{d}:{d}: syntax error: {s}\n", .{
+            source_name, parser.failure.line, parser.failure.column, parser.failure.message,
+        });
+        return err;
+    };
 }
 
 /// Emits a self-contained launcher containing the exact Lua source bytes. The
