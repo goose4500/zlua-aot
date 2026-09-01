@@ -1,5 +1,5 @@
 const std = @import("std");
-const lex = @import("lexer.zig");
+const lex = @import("../frontend/lexer.zig");
 
 pub const Op = enum { add, sub, mul, div };
 pub const Expr = union(enum) { number: lex.Token, parameter: usize, unary_minus: usize, binary: struct { op: Op, left: usize, right: usize } };

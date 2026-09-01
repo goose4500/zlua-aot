@@ -1,5 +1,5 @@
 const std = @import("std");
-const lex = @import("lexer.zig");
+const lex = @import("../frontend/lexer.zig");
 
 pub const UnaryOp = enum { positive, negative };
 pub const BinaryOp = enum { add, subtract, multiply, divide };

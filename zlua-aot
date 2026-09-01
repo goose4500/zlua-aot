@@ -7,6 +7,13 @@ fi
 input=$1
 output=$2
 cpu=${3:-native}
+case "$cpu" in
+  native-cpu|native|baseline) ;;
+  *)
+    echo "zlua-aot: unknown build mode '$cpu' (expected native-cpu or baseline)" >&2
+    exit 2
+    ;;
+esac
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/zlua-aot
 mkdir -p "$cache"

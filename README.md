@@ -53,6 +53,19 @@ LuaJIT is required only for programs selecting the fallback backend. `RTLD_GLOBA
 - `examples/numeric.lua` is a small whole-chunk numeric workload.
 - `examples/hybrid.lua` calls a guarded native function from dynamic Lua and tests its Lua fallback.
 
+## Source layout
+
+```text
+src/
+├── main.zig              # Minimal executable entry point
+├── driver/               # CLI, filesystem I/O, and pipeline orchestration
+├── frontend/             # Lexer, AST data, parser, and name resolution
+├── ir/                   # Whole-program numeric IR and hybrid kernel planning
+└── backend/              # LuaJIT launcher and C wrapper emission
+```
+
+Dependencies flow from the driver through the frontend and IR into the backend. The CLI is kept separate from the compiler pipeline so future embedding and alternate frontends do not depend on process arguments or filesystem I/O.
+
 ## Architecture roadmap
 
 1. **Compatibility backend (complete):** complete language and C-module behavior through system LuaJIT.
