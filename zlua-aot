@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "usage: ./zlua-aot <input.lua> <output> [native-cpu|baseline]" >&2
+  exit 2
+fi
+input=$1
+output=$2
+cpu=${3:-native}
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/zlua-aot
+mkdir -p "$cache"
+zig build-exe "$root/src/main.zig" -O ReleaseFast -femit-bin="$cache/zlua-emit"
+tmp=$(mktemp "${TMPDIR:-/tmp}/zlua-aot.XXXXXX.c")
+trap 'rm -f "$tmp"' EXIT INT TERM
+"$cache/zlua-emit" "$input" "$tmp"
+if [ "$cpu" = native-cpu ] || [ "$cpu" = native ]; then
+  zig cc -O3 -march=native -flto "$tmp" -ldl -o "$output"
+else
+  zig cc -O2 "$tmp" -ldl -o "$output"
+fi
+printf 'AOT compiled %s -> %s (%s)\n' "$input" "$output" "$cpu"
