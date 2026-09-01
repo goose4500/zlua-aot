@@ -66,6 +66,17 @@ src/
 
 Dependencies flow from the driver through the frontend and IR into the backend. The CLI is kept separate from the compiler pipeline so future embedding and alternate frontends do not depend on process arguments or filesystem I/O.
 
+## Benchmarks
+
+The permanent benchmark suite compares unannotated LuaJIT execution, guarded hybrid functions, and standalone numeric programs while checking paired outputs for correctness:
+
+```sh
+./benchmarks/run.sh quick
+./benchmarks/run.sh full
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for methodology and recorded machine-specific results. The initial ARM64 measurements show that tiny hybrid functions are currently slower than LuaJIT because each call crosses the Lua/C API boundary; standalone numeric mode produces smaller, LuaJIT-independent artifacts.
+
 ## Architecture roadmap
 
 1. **Compatibility backend (complete):** complete language and C-module behavior through system LuaJIT.
