@@ -43,8 +43,8 @@ LuaJIT is required only for programs selecting the fallback backend. `RTLD_GLOBA
 
 1. **Compatibility backend (complete):** complete language and C-module behavior through system LuaJIT.
 2. **Frontend (in progress):** the Zig lexer and recursive-descent parser cover Lua 5.1 syntax and produce an allocator-owned, source-spanned AST. Semantic analysis tracks lexical scopes, declarations and parameters; resolves every name as local, upvalue or global; marks captured symbols; handles initializer visibility and function boundaries; and validates `break`/vararg context. Hierarchical typed expression nodes remain next.
-3. **Native numeric backend (initial):** scalar numeric declarations, assignments, arithmetic, printing and returns lower directly to optimized native code with no Lua VM dependency.
-4. **Typed IR and function kernels:** replace chunk-level eligibility with hierarchical expression types, guards, and native lowering of individual functions inside otherwise dynamic programs.
+3. **Typed native numeric IR (complete initial pass):** eligible chunks are parsed into allocator-owned symbol, statement, unary-expression and precedence-aware binary-expression nodes. Every IR value is proven numeric before recursive native emission; unsupported input produces no partial output.
+4. **Function kernels:** extend the typed IR with parameters, control flow and guards, then lower eligible individual functions inside otherwise dynamic LuaJIT programs.
 5. **Deoptimization bridge:** fall back to LuaJIT when specialization guards fail.
 6. **Profile-guided builds:** collect representative types and specialize for Surface Pro 11 ARM64.
 7. **Shared-library mode:** export specialized functions through a LuaJIT FFI/C ABI.
